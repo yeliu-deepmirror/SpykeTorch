@@ -174,10 +174,19 @@ def train_rl(network, data, target, loose=False):
             target_in = target_in.cuda()
         d = network(data_in, 3)
         if d != -1:
-            if pass_test(d, target_in, loose):
+            # if pass_test(d, target_in, loose):
+            #     perf[0]+=1
+            #     network.reward()
+            # else:
+            #     perf[1]+=1
+            #     network.punish()
+            if d == target:
                 perf[0]+=1
                 network.reward()
-            else:
+            elif (loose and abs(d - target) < 2):
+                perf[0]+=1
+                # close but not encourage
+            else :
                 perf[1]+=1
                 network.punish()
         else:
@@ -185,9 +194,10 @@ def train_rl(network, data, target, loose=False):
     return perf/len(data)
 
 
-def test(network, data, target, loose=False):
+def test(network, data, target):
     network.eval()
     perf = np.array([0,0,0]) # correct, wrong, silence
+    perf_loose = np.array([0,0,0]) # correct, wrong, silence
     for i in range(len(data)):
         data_in = data[i]
         target_in = target[i]
@@ -196,13 +206,18 @@ def test(network, data, target, loose=False):
             target_in = target_in.cuda()
         d = network(data_in, 3)
         if d != -1:
-            if pass_test(d, target_in, loose):
+            if pass_test(d, target_in, False):
                 perf[0]+=1
             else:
                 perf[1]+=1
+            if pass_test(d, target_in, True):
+                perf_loose[0]+=1
+            else:
+                perf_loose[1]+=1
         else:
             perf[2]+=1
-    return perf/len(data)
+            perf_loose[2]+=1
+    return perf/len(data), perf_loose/len(data)
 
 
 class S1C1Transform:
@@ -246,8 +261,9 @@ def train_heading():
 
     # splitting training and testing sets
     indices = list(range(len(dataset)))
+    random.seed(2077)   # set seed to always give the same split
     random.shuffle(indices)
-    split_point = int(0.75*len(indices))
+    split_point = int(0.8*len(indices))
     train_indices = indices[:split_point]
     test_indices = indices[split_point:]
     print("Size of the training set:", len(train_indices))
@@ -273,7 +289,7 @@ def train_heading():
         mozafari.load_state_dict(torch.load(layer_1_path))
     else:
         print("Training the first layer")
-        for epoch in range(20):
+        for epoch in range(10):
             print("Epoch", epoch)
             for data,targets in train_loader:
                 train_unsupervise(mozafari, data, 1)
@@ -284,7 +300,7 @@ def train_heading():
         mozafari.load_state_dict(torch.load(layer_2_path))
     else:
         print("Training the second layer")
-        for epoch in range(40):
+        for epoch in range(20):
             print("Epoch", epoch)
             for data,targets in train_loader:
                 train_unsupervise(mozafari, data, 2)
@@ -298,10 +314,6 @@ def train_heading():
 
     adaptive_min = 0
     adaptive_int = 1
-    apr_adapt = ((1.0 - 1.0 / 10) * adaptive_int + adaptive_min) * apr
-    anr_adapt = ((1.0 - 1.0 / 10) * adaptive_int + adaptive_min) * anr
-    app_adapt = ((1.0 / 10) * adaptive_int + adaptive_min) * app
-    anp_adapt = ((1.0 / 10) * adaptive_int + adaptive_min) * anp
 
     # perf
     best_train = np.array([0.0,0.0,0.0,0.0]) # correct, wrong, silence, epoch
@@ -330,8 +342,9 @@ def train_heading():
         perf_test = np.array([0.0,0.0,0.0])
         perf_test_loose = np.array([0.0,0.0,0.0])
         for data,targets in test_loader:
-            perf_test += test(mozafari, data, targets, False)
-            perf_test_loose += test(mozafari, data, targets, True)
+            perf_t, perf_loose_t = test(mozafari, data, targets)
+            perf_test += perf_t
+            perf_test_loose += perf_loose_t
         perf_test /= len(test_loader)
         perf_test_loose /= len(test_loader)
 
@@ -342,16 +355,17 @@ def train_heading():
             best_test_loose = np.append(perf_test_loose, epoch)
             torch.save(mozafari.state_dict(), layer_3l_path)
 
-        print(" Current Test:", perf_test, perf_test_loose)
-        print("    Best Test:", best_test, best_test_loose)
+        print(" Current Test:", perf_test[0:2], perf_test_loose[0:2])
+        print("    Best Test:", best_test[0:2], best_test_loose[0:2])
 
         # update adaptive learning rates
-        apr_adapt = apr * (perf_train[1] * adaptive_int + adaptive_min)
-        anr_adapt = anr * (perf_train[1] * adaptive_int + adaptive_min)
-        app_adapt = app * (perf_train[0] * adaptive_int + adaptive_min)
-        anp_adapt = anp * (perf_train[0] * adaptive_int + adaptive_min)
-        print("  Update learing rates :", apr_adapt, anr_adapt, app_adapt, anp_adapt)
-        mozafari.update_learning_rates(apr_adapt, anr_adapt, app_adapt, anp_adapt)
+        if not loose:
+            apr_adapt = apr * (perf_train[1] * adaptive_int + adaptive_min)
+            anr_adapt = anr * (perf_train[1] * adaptive_int + adaptive_min)
+            app_adapt = app * (perf_train[0] * adaptive_int + adaptive_min)
+            anp_adapt = anp * (perf_train[0] * adaptive_int + adaptive_min)
+            print("  Update learing rates :", apr_adapt, anr_adapt, app_adapt, anp_adapt)
+            mozafari.update_learning_rates(apr_adapt, anr_adapt, app_adapt, anp_adapt)
 
 
 def train_mnist():
@@ -435,7 +449,7 @@ def train_mnist():
         print("   Best Train:", best_train)
 
         for data,targets in MNIST_testLoader:
-            perf_test = test(mozafari, data, targets)
+            perf_test, _ = test(mozafari, data, targets)
             if best_test[0] <= perf_test[0]:
                 best_test = np.append(perf_test, epoch)
                 torch.save(mozafari.state_dict(), "saved.net")
