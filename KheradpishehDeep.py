@@ -10,7 +10,7 @@
 ###################################################################################
 
 import os
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 import torch
@@ -49,7 +49,7 @@ class KheradpishehMNIST(nn.Module):
         self.ctx = {"input_spikes":None, "potentials":None, "output_spikes":None, "winners":None}
         self.spk_cnt1 = 0
         self.spk_cnt2 = 0
-    
+
     def save_data(self, input_spike, potentials, output_spikes, winners):
         self.ctx["input_spikes"] = input_spike
         self.ctx["potentials"] = potentials
@@ -93,7 +93,7 @@ class KheradpishehMNIST(nn.Module):
             spk, pot = sf.fire(pot, self.conv2_t, True)
             spk = sf.pooling(spk, 2, 2, 1)
             return spk
-    
+
     def stdp(self, layer_idx):
         if layer_idx == 1:
             self.stdp1(self.ctx["input_spikes"], self.ctx["potentials"], self.ctx["output_spikes"], self.ctx["winners"])
@@ -139,77 +139,79 @@ class S1Transform:
         temporal_image = self.temporal_transform(image)
         return temporal_image.sign().byte()
 
-kernels = [ utils.DoGKernel(7,1,2),
-            utils.DoGKernel(7,2,1),]
-filter = utils.Filter(kernels, padding = 3, thresholds = 50)
-s1 = S1Transform(filter)
 
-data_root = "data"
-MNIST_train = utils.CacheDataset(torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform = s1))
-MNIST_test = utils.CacheDataset(torchvision.datasets.MNIST(root=data_root, train=False, download=True, transform = s1))
-MNIST_loader = DataLoader(MNIST_train, batch_size=len(MNIST_train), shuffle=False)
-MNIST_testLoader = DataLoader(MNIST_test, batch_size=len(MNIST_test), shuffle=False)
+if __name__ == "__main__":
+    kernels = [ utils.DoGKernel(7,1,2),
+                utils.DoGKernel(7,2,1),]
+    filter = utils.Filter(kernels, padding = 3, thresholds = 50)
+    s1 = S1Transform(filter)
 
-kheradpisheh = KheradpishehMNIST()
-if use_cuda:
-    kheradpisheh.cuda()
+    data_root = "data"
+    MNIST_train = utils.CacheDataset(torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform = s1))
+    MNIST_test = utils.CacheDataset(torchvision.datasets.MNIST(root=data_root, train=False, download=True, transform = s1))
+    MNIST_loader = DataLoader(MNIST_train, batch_size=len(MNIST_train), shuffle=False)
+    MNIST_testLoader = DataLoader(MNIST_test, batch_size=len(MNIST_test), shuffle=False)
 
-# Training The First Layer
-print("Training the first layer")
-if os.path.isfile("saved_l1.net"):
-    kheradpisheh.load_state_dict(torch.load("saved_l1.net"))
-else:
-    for epoch in range(2):
+    kheradpisheh = KheradpishehMNIST()
+    if use_cuda:
+        kheradpisheh.cuda()
+
+    # Training The First Layer
+    print("Training the first layer")
+    if os.path.isfile("saved_l1.net"):
+        kheradpisheh.load_state_dict(torch.load("saved_l1.net"))
+    else:
+        for epoch in range(2):
+            print("Epoch", epoch)
+            iter = 0
+            for data,_ in MNIST_loader:
+                print("Iteration", iter)
+                train_unsupervise(kheradpisheh, data, 1)
+                print("Done!")
+                iter+=1
+        torch.save(kheradpisheh.state_dict(), "saved_l1.net")
+
+    # Training The Second Layer
+    print("Training the second layer")
+    if os.path.isfile("saved_l2.net"):
+        kheradpisheh.load_state_dict(torch.load("saved_l2.net"))
+    for epoch in range(20):
         print("Epoch", epoch)
         iter = 0
         for data,_ in MNIST_loader:
             print("Iteration", iter)
-            train_unsupervise(kheradpisheh, data, 1)
+            train_unsupervise(kheradpisheh, data, 2)
             print("Done!")
             iter+=1
-    torch.save(kheradpisheh.state_dict(), "saved_l1.net")
+    torch.save(kheradpisheh.state_dict(), "saved_l2.net")
 
-# Training The Second Layer
-print("Training the second layer")
-if os.path.isfile("saved_l2.net"):
-    kheradpisheh.load_state_dict(torch.load("saved_l2.net"))
-for epoch in range(20):
-    print("Epoch", epoch)
-    iter = 0
-    for data,_ in MNIST_loader:
-        print("Iteration", iter)
-        train_unsupervise(kheradpisheh, data, 2)
-        print("Done!")
-        iter+=1
-torch.save(kheradpisheh.state_dict(), "saved_l2.net")
+    # Classification
+    # Get train data
+    for data,target in MNIST_loader:
+        train_X, train_y = test(kheradpisheh, data, target, 2)
 
-# Classification
-# Get train data
-for data,target in MNIST_loader:
-    train_X, train_y = test(kheradpisheh, data, target, 2)
-    
 
-# Get test data
-for data,target in MNIST_testLoader:
-    test_X, test_y = test(kheradpisheh, data, target, 2)
+    # Get test data
+    for data,target in MNIST_testLoader:
+        test_X, test_y = test(kheradpisheh, data, target, 2)
 
-# SVM
-from sklearn.svm import LinearSVC
-clf = LinearSVC(C=2.4)
-clf.fit(train_X, train_y)
-predict_train = clf.predict(train_X)
-predict_test = clf.predict(test_X)
+    # SVM
+    from sklearn.svm import LinearSVC
+    clf = LinearSVC(C=2.4)
+    clf.fit(train_X, train_y)
+    predict_train = clf.predict(train_X)
+    predict_test = clf.predict(test_X)
 
-def get_performance(X, y, predictions):
-    correct = 0
-    silence = 0
-    for i in range(len(predictions)):
-        if X[i].sum() == 0:
-            silence += 1
-        else:
-            if predictions[i] == y[i]:
-                correct += 1
-    return (correct/len(X), (len(X)-(correct+silence))/len(X), silence/len(X))
+    def get_performance(X, y, predictions):
+        correct = 0
+        silence = 0
+        for i in range(len(predictions)):
+            if X[i].sum() == 0:
+                silence += 1
+            else:
+                if predictions[i] == y[i]:
+                    correct += 1
+        return (correct/len(X), (len(X)-(correct+silence))/len(X), silence/len(X))
 
-print(get_performance(train_X, train_y, predict_train))
-print(get_performance(test_X, test_y, predict_test))
+    print(get_performance(train_X, train_y, predict_train))
+    print(get_performance(test_X, test_y, predict_test))
