@@ -252,3 +252,4 @@ SpykeTorch/__pycache__
 .fake/
 dataset/heading
 data
+model

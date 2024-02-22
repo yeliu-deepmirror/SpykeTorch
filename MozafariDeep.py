@@ -15,9 +15,10 @@ import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
+import random
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from torchvision.datasets import ImageFolder
 from torch.nn.parameter import Parameter
 import torchvision
@@ -31,7 +32,7 @@ from torchvision import transforms
 use_cuda = True
 
 class MozafariMNIST2018(nn.Module):
-    def __init__(self):
+    def __init__(self, max_classes = 10):
         super(MozafariMNIST2018, self).__init__()
 
         self.conv1 = snn.Convolution(6, 30, 5, 0.8, 0.05)
@@ -53,8 +54,9 @@ class MozafariMNIST2018(nn.Module):
         self.max_ap = Parameter(torch.Tensor([0.15]))
 
         self.decision_map = []
-        for i in range(10):
-            self.decision_map.extend([i]*20)
+        num_each_class = int(200 / max_classes)
+        for i in range(max_classes):
+            self.decision_map.extend([i]*num_each_class)
 
         self.ctx = {"input_spikes":None, "potentials":None, "output_spikes":None, "winners":None}
         self.spk_cnt1 = 0
@@ -154,7 +156,14 @@ def train_unsupervise(network, data, layer_idx):
         network(data_in, layer_idx)
         network.stdp(layer_idx)
 
-def train_rl(network, data, target):
+
+def pass_test(d, target, loose):
+    if loose :
+        return abs(d - target) < 2
+    return d == target
+
+
+def train_rl(network, data, target, loose=False):
     network.train()
     perf = np.array([0,0,0]) # correct, wrong, silence
     for i in range(len(data)):
@@ -165,7 +174,7 @@ def train_rl(network, data, target):
             target_in = target_in.cuda()
         d = network(data_in, 3)
         if d != -1:
-            if d == target_in:
+            if pass_test(d, target_in, loose):
                 perf[0]+=1
                 network.reward()
             else:
@@ -175,7 +184,8 @@ def train_rl(network, data, target):
             perf[2]+=1
     return perf/len(data)
 
-def test(network, data, target):
+
+def test(network, data, target, loose=False):
     network.eval()
     perf = np.array([0,0,0]) # correct, wrong, silence
     for i in range(len(data)):
@@ -186,7 +196,7 @@ def test(network, data, target):
             target_in = target_in.cuda()
         d = network(data_in, 3)
         if d != -1:
-            if d == target_in:
+            if pass_test(d, target_in, loose):
                 perf[0]+=1
             else:
                 perf[1]+=1
@@ -194,16 +204,19 @@ def test(network, data, target):
             perf[2]+=1
     return perf/len(data)
 
+
 class S1C1Transform:
-    def __init__(self, filter, timesteps = 15):
+    def __init__(self, filter, gray = False, timesteps = 15):
         self.to_tensor = transforms.ToTensor()
+        self.gray = gray
+        self.gray_scale = transforms.Grayscale()
         self.filter = filter
         self.temporal_transform = utils.Intensity2Latency(timesteps)
-        self.cnt = 0
+
+
     def __call__(self, image):
-        if self.cnt % 1000 == 0:
-            print(self.cnt)
-        self.cnt+=1
+        if self.gray:
+            image = self.gray_scale(image)
         image = self.to_tensor(image) * 255
         image.unsqueeze_(0)
         image = self.filter(image)
@@ -211,15 +224,138 @@ class S1C1Transform:
         temporal_image = self.temporal_transform(image)
         return temporal_image.sign().byte()
 
-if __name__ == "__main__":
+
+def get_transforms(gray = False):
     kernels = [ utils.DoGKernel(3,3/9,6/9),
                 utils.DoGKernel(3,6/9,3/9),
                 utils.DoGKernel(7,7/9,14/9),
                 utils.DoGKernel(7,14/9,7/9),
                 utils.DoGKernel(13,13/9,26/9),
                 utils.DoGKernel(13,26/9,13/9)]
-    filter = utils.Filter(kernels, padding = 6, thresholds = 50)
-    s1c1 = S1C1Transform(filter)
+    filter_feature = utils.Filter(kernels, padding = 6, thresholds = 50)
+    s1c1 = S1C1Transform(filter_feature, gray)
+    return s1c1
+
+
+def train_heading():
+    s1c1 = get_transforms(True)
+
+    model_root = "model/"
+    dataset = ImageFolder("dataset/heading", s1c1) # adding transform to the dataset
+    print("Load", len(dataset), "data")
+
+    # splitting training and testing sets
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    split_point = int(0.75*len(indices))
+    train_indices = indices[:split_point]
+    test_indices = indices[split_point:]
+    print("Size of the training set:", len(train_indices))
+    print("Size of the  testing set:", len(test_indices))
+
+    dataset = utils.CacheDataset(dataset)
+    train_loader = DataLoader(dataset, sampler=SubsetRandomSampler(train_indices))
+    test_loader = DataLoader(dataset, sampler=SubsetRandomSampler(test_indices))
+
+    mozafari = MozafariMNIST2018(20)
+    if use_cuda:
+        mozafari.cuda()
+    print(mozafari)
+    print(mozafari.decision_map)
+
+    # Training The First Layer
+    layer_1_path = model_root + "/saved_l1.net"
+    layer_2_path = model_root + "/saved_l2.net"
+    layer_3_path = model_root + "/saved_l3.net"
+    layer_3l_path = model_root + "/saved_l3l.net"
+    if os.path.isfile(layer_1_path):
+        print("Loading the first layer")
+        mozafari.load_state_dict(torch.load(layer_1_path))
+    else:
+        print("Training the first layer")
+        for epoch in range(20):
+            print("Epoch", epoch)
+            for data,targets in train_loader:
+                train_unsupervise(mozafari, data, 1)
+        torch.save(mozafari.state_dict(), layer_1_path)
+    # Training The Second Layer
+    if os.path.isfile(layer_2_path):
+        print("Loading the second layer")
+        mozafari.load_state_dict(torch.load(layer_2_path))
+    else:
+        print("Training the second layer")
+        for epoch in range(40):
+            print("Epoch", epoch)
+            for data,targets in train_loader:
+                train_unsupervise(mozafari, data, 2)
+        torch.save(mozafari.state_dict(), layer_2_path)
+
+    # initial adaptive learning rates
+    apr = mozafari.stdp3.learning_rate[0][0].item()
+    anr = mozafari.stdp3.learning_rate[0][1].item()
+    app = mozafari.anti_stdp3.learning_rate[0][1].item()
+    anp = mozafari.anti_stdp3.learning_rate[0][0].item()
+
+    adaptive_min = 0
+    adaptive_int = 1
+    apr_adapt = ((1.0 - 1.0 / 10) * adaptive_int + adaptive_min) * apr
+    anr_adapt = ((1.0 - 1.0 / 10) * adaptive_int + adaptive_min) * anr
+    app_adapt = ((1.0 / 10) * adaptive_int + adaptive_min) * app
+    anp_adapt = ((1.0 / 10) * adaptive_int + adaptive_min) * anp
+
+    # perf
+    best_train = np.array([0.0,0.0,0.0,0.0]) # correct, wrong, silence, epoch
+    best_test = np.array([0.0,0.0,0.0,0.0]) # correct, wrong, silence, epoch
+    best_test_loose = np.array([0.0,0.0,0.0,0.0]) # correct, wrong, silence, epoch
+
+    # Training The Third Layer
+    if os.path.isfile(layer_3_path):
+        print("Loading the third layer")
+        mozafari.load_state_dict(torch.load(layer_3_path))
+
+    print("Training the third layer")
+    for epoch in range(680):
+        # train one loose and one tight
+        loose = (epoch%2 == 0)
+        print("Epoch #:", epoch, loose)
+        perf_train = np.array([0.0,0.0,0.0])
+        for data,targets in train_loader:
+            perf_train += train_rl(mozafari, data, targets, loose)
+        perf_train /= len(train_loader)
+        if best_train[0] <= perf_train[0]:
+            best_train = np.append(perf_train, epoch)
+        print("Current Train:", perf_train)
+        print("   Best Train:", best_train)
+
+        perf_test = np.array([0.0,0.0,0.0])
+        perf_test_loose = np.array([0.0,0.0,0.0])
+        for data,targets in test_loader:
+            perf_test += test(mozafari, data, targets, False)
+            perf_test_loose += test(mozafari, data, targets, True)
+        perf_test /= len(test_loader)
+        perf_test_loose /= len(test_loader)
+
+        if best_test[0] <= perf_test[0]:
+            best_test = np.append(perf_test, epoch)
+            torch.save(mozafari.state_dict(), layer_3_path)
+        if best_test_loose[0] <= perf_test_loose[0]:
+            best_test_loose = np.append(perf_test_loose, epoch)
+            torch.save(mozafari.state_dict(), layer_3l_path)
+
+        print(" Current Test:", perf_test, perf_test_loose)
+        print("    Best Test:", best_test, best_test_loose)
+
+        # update adaptive learning rates
+        apr_adapt = apr * (perf_train[1] * adaptive_int + adaptive_min)
+        anr_adapt = anr * (perf_train[1] * adaptive_int + adaptive_min)
+        app_adapt = app * (perf_train[0] * adaptive_int + adaptive_min)
+        anp_adapt = anp * (perf_train[0] * adaptive_int + adaptive_min)
+        print("  Update learing rates :", apr_adapt, anr_adapt, app_adapt, anp_adapt)
+        mozafari.update_learning_rates(apr_adapt, anr_adapt, app_adapt, anp_adapt)
+
+
+def train_mnist():
+    s1c1 = get_transforms()
 
     data_root = "data"
     MNIST_train = utils.CacheDataset(torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform = s1c1))
@@ -305,3 +441,8 @@ if __name__ == "__main__":
                 torch.save(mozafari.state_dict(), "saved.net")
             print(" Current Test:", perf_test)
             print("    Best Test:", best_test)
+
+
+if __name__ == "__main__":
+    train_heading()
+    # train_mnist()
